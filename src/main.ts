@@ -1,4 +1,5 @@
 import './tracing';
+import { ConfigService } from '@nestjs/config';
 import { NestFactory } from '@nestjs/core';
 import { NestExpressApplication } from '@nestjs/platform-express';
 import helmet from 'helmet';
@@ -12,6 +13,10 @@ import { LoggerService } from './common/services/logger.service';
 import { configureApp } from './app.setup';
 import { RedisIoAdapter } from './realtime/redis-io.adapter';
 import { runProductionSafetyCheck } from './config/production-safety.check';
+import {
+  allowedOrigins,
+  allowsWebSocketWithoutOrigin,
+} from './common/security/cors';
 
 /**
  * Reads a positive integer of milliseconds from the environment, falling back
@@ -33,7 +38,9 @@ function readTimeoutMs(name: string, fallback: number): number {
   }
   const value = Number(raw);
   if (!Number.isInteger(value) || value <= 0) {
-    throw new Error(`${name} must be a positive integer (milliseconds), got "${raw}"`);
+    throw new Error(
+      `${name} must be a positive integer (milliseconds), got "${raw}"`,
+    );
   }
   return value;
 }
@@ -45,9 +52,27 @@ function readTimeoutMs(name: string, fallback: number): number {
 const DEFAULT_BODY_LIMIT = '100kb';
 
 async function bootstrap() {
+  // Refuse to start in production when unsafe settings are detected. This runs
+  // before the Nest app is created so a misconfigured deployment fails fast
+  // with a single error naming every offending setting.
+  if (process.env.NODE_ENV === 'production') {
+    const problems = runProductionSafetyCheck(process.env);
+    if (problems.length > 0) {
+      throw new Error(
+        `Refusing to start in production due to unsafe configuration:\n- ${problems.join('\n- ')}`,
+      );
+    }
+  }
+
   // Instantiate the Winston logger before the app so bootstrap messages
   // also go through it.
   const winstonLogger = new LoggerService();
+  winstonLogger.log(
+    `WebSocket connections without an Origin header are ${
+      allowsWebSocketWithoutOrigin() ? 'allowed' : 'rejected'
+    }`,
+    'Bootstrap',
+  );
 
   const app = await NestFactory.create<NestExpressApplication>(AppModule, {
     // Suppress Nest's default console logger; our Winston instance takes over.
@@ -72,11 +97,11 @@ async function bootstrap() {
 
   // Realtime events fan out through Redis when REDIS_URL is set, so every
   // instance can reach every connected player.
-  if (process.env.REDIS_URL) {
-    const ioAdapter = new RedisIoAdapter(app);
-    await ioAdapter.connectToRedis(process.env.REDIS_URL);
-    app.useWebSocketAdapter(ioAdapter);
-  }
+  const config = app.get(ConfigService);
+  const ioAdapter = new RedisIoAdapter(app, config);
+  const redisUrl = config.get<string>('REDIS_URL');
+  if (redisUrl) await ioAdapter.connectToRedis(redisUrl);
+  app.useWebSocketAdapter(ioAdapter);
 
   // HTTP metrics for every response, including guard and pipe rejections
   // and 404s, labelled by route template (#361). Registered before any route
@@ -121,13 +146,8 @@ async function bootstrap() {
   // CORS must be registered before the server starts listening, otherwise the
   // configuration is not applied to the running HTTP adapter. FRONTEND_URL may
   // hold a comma-separated list of allowed origins.
-  const allowedOrigins = (process.env.FRONTEND_URL || 'http://localhost:3000')
-    .split(',')
-    .map((origin) => origin.trim())
-    .filter((origin) => origin.length > 0);
-
   app.enableCors({
-    origin: allowedOrigins,
+    origin: allowedOrigins(),
     credentials: true,
   });
 
@@ -148,11 +168,6 @@ async function bootstrap() {
   httpServer.requestTimeout = requestTimeout;
   httpServer.headersTimeout = headersTimeout;
   httpServer.keepAliveTimeout = keepAliveTimeout;
-
-  // Refuse to start in production when unsafe settings are detected. This runs
-  // before the server starts listening so a misconfigured deployment fails
-  // fast with a message naming every offending setting.
-  runProductionSafetyCheck();
 
   const port = process.env.PORT ?? 3000;
   // All interfaces by default: inside a container, localhost is only the

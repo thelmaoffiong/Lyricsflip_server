@@ -7,11 +7,13 @@ import { User } from '../users/entities/user.entity';
 import { CreateLyricsDto } from './dto/create-lyrics.dto';
 import { UpdateLyricsDto } from './dto/update-lyrics.dto';
 import { cacheConfig } from '../config/cache.config';
+import { DataSource } from 'typeorm';
 
 describe('LyricsService', () => {
   let service: LyricsService;
   let mockRepository: any;
   let mockCacheManager: any;
+  let mockDataSource: any;
 
   const mockUser: User = {
     id: '1',
@@ -61,6 +63,10 @@ describe('LyricsService', () => {
       del: jest.fn(),
     };
 
+    mockDataSource = {
+      transaction: jest.fn(async (cb: any) => cb({} as any)),
+    };
+
     const module: TestingModule = await Test.createTestingModule({
       providers: [
         LyricsService,
@@ -71,6 +77,10 @@ describe('LyricsService', () => {
         {
           provide: CACHE_MANAGER,
           useValue: mockCacheManager,
+        },
+        {
+          provide: DataSource,
+          useValue: mockDataSource,
         },
       ],
     }).compile();
@@ -84,13 +94,13 @@ describe('LyricsService', () => {
 
   describe('create', () => {
     it('should create lyrics and clear cache', async () => {
-      const createDto: CreateLyricsDto = {
+      const createDto = {
         content: 'New lyrics',
         artist: 'New Artist',
         songTitle: 'New Song',
         genre: 'Hip-Hop' as any,
         decade: 2023,
-      };
+      } as unknown as CreateLyricsDto;
 
       mockRepository.create.mockReturnValue(mockLyrics);
       mockRepository.save.mockResolvedValue(mockLyrics);
@@ -98,11 +108,16 @@ describe('LyricsService', () => {
       const result = await service.create(createDto, mockUser);
 
       expect(result).toEqual(mockLyrics);
-      expect(mockRepository.create).toHaveBeenCalledWith({
-        ...createDto,
-        decade: '2023',
-        createdBy: mockUser,
-      });
+      // lyricSnippet is derived from content; content is then nulled out.
+      expect(mockRepository.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          artist: 'New Artist',
+          songTitle: 'New Song',
+          content: null,
+          decade: '2023s',
+          createdBy: mockUser,
+        }),
+      );
       expect(mockRepository.save).toHaveBeenCalled();
     });
   });
@@ -114,7 +129,10 @@ describe('LyricsService', () => {
       const result = await service.findOne(1);
 
       expect(result).toEqual(mockLyrics);
-      expect(mockCacheManager.get).toHaveBeenCalledWith('lyrics:1');
+      // The key is namespaced with the current version (0 when unset).
+      expect(mockCacheManager.get).toHaveBeenCalledWith(
+        expect.stringContaining('lyrics:1'),
+      );
       expect(mockRepository.findOne).not.toHaveBeenCalled();
     });
 
@@ -125,12 +143,18 @@ describe('LyricsService', () => {
       const result = await service.findOne(1);
 
       expect(result).toEqual(mockLyrics);
-      expect(mockCacheManager.get).toHaveBeenCalledWith('lyrics:1');
+      expect(mockCacheManager.get).toHaveBeenCalledWith(
+        expect.stringContaining('lyrics:1'),
+      );
       expect(mockRepository.findOne).toHaveBeenCalledWith({
         where: { id: 1, isActive: true },
         relations: ['createdBy'],
       });
-      expect(mockCacheManager.set).toHaveBeenCalledWith('lyrics:1', mockLyrics, cacheConfig.lyricsTtlMs);
+      expect(mockCacheManager.set).toHaveBeenCalledWith(
+        expect.stringContaining('lyrics:1'),
+        mockLyrics,
+        cacheConfig.lyricsTtlMs,
+      );
     });
   });
 
@@ -225,7 +249,7 @@ describe('LyricsService', () => {
         }),
       };
 
-      svc = new LyricsService(repo as any, cache as any);
+      svc = new LyricsService(repo as any, cache as any, mockDataSource as any);
     });
 
     const readAll = async () => ({
@@ -308,6 +332,87 @@ describe('LyricsService', () => {
       } finally {
         jest.useRealTimers();
       }
+    });
+
+    it('invalidateCache removes only the requested keys', async () => {
+      await readAll();
+      expect(store.size).toBe(3);
+
+      await svc.invalidateCache(['lyrics:1']);
+
+      expect(store.has('lyrics:1')).toBe(false);
+      expect(store.size).toBe(2);
+    });
+  });
+
+  describe('findByArtist', () => {
+    it('returns active lyrics for the given artist', async () => {
+      mockRepository.find.mockResolvedValue([mockLyrics]);
+
+      const result = await service.findByArtist('Test Artist');
+
+      expect(result).toEqual([mockLyrics]);
+      expect(mockRepository.find).toHaveBeenCalledWith({
+        where: { artist: 'Test Artist', isActive: true },
+        relations: ['createdBy'],
+      });
+    });
+  });
+
+  describe('findExistingKeys', () => {
+    it('returns the set of artist/title keys that already exist', async () => {
+      mockRepository.find.mockResolvedValue([
+        { artist: 'A', songTitle: 'One' },
+        { artist: 'B', songTitle: 'Two' },
+      ]);
+
+      const keys = await service.findExistingKeys([
+        { artist: 'A', songTitle: 'One' },
+        { artist: 'C', songTitle: 'Three' },
+      ]);
+
+      expect(keys).toEqual(new Set(['a|one', 'b|two']));
+    });
+
+    it('returns an empty set for an empty input', async () => {
+      const keys = await service.findExistingKeys([]);
+
+      expect(keys).toEqual(new Set());
+      expect(mockRepository.find).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('bulkUpsert', () => {
+    it('inserts new rows and updates existing ones inside one transaction', async () => {
+      const existing = { ...mockLyrics, id: 1, artist: 'A', songTitle: 'One' };
+      const manager = {
+        findOne: jest.fn(async ({ where }: any) =>
+          where.artist === 'A' && where.songTitle === 'One' ? { ...existing } : null,
+        ),
+        create: jest.fn((_entity: any, data: any) => ({ ...data })),
+        save: jest.fn(async (entity: any, data: any) => data),
+      };
+      mockDataSource.transaction.mockImplementation(async (cb: any) => cb(manager));
+
+      const result = await service.bulkUpsert(
+        [
+          { artist: 'A', songTitle: 'One', content: 'updated' } as any,
+          { artist: 'B', songTitle: 'Two', content: 'new' } as any,
+        ],
+        mockUser,
+      );
+
+      expect(mockDataSource.transaction).toHaveBeenCalledTimes(1);
+      expect(manager.save).toHaveBeenCalledTimes(2);
+      expect(result).toEqual({ inserted: 1, updated: 1 });
+    });
+
+    it('rolls back (rejects) when the transaction fails', async () => {
+      mockDataSource.transaction.mockRejectedValue(new Error('boom'));
+
+      await expect(
+        service.bulkUpsert([{ artist: 'A', songTitle: 'One' } as any], mockUser),
+      ).rejects.toThrow('boom');
     });
   });
 });

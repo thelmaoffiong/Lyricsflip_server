@@ -1,7 +1,12 @@
+import { recordReferralRound } from '../referrals/referral-rewards.service';
 import {
+  DomainException,
+  ErrorCode,
+} from '../common/exceptions/domain.exception';
+import {
+  HttpStatus,
   BadRequestException,
   ConflictException,
-  GoneException,
   Injectable,
   Logger,
   NotFoundException,
@@ -10,8 +15,9 @@ import { ConfigService } from '@nestjs/config';
 import { EventEmitter2 } from '@nestjs/event-emitter';
 import { Cron, CronExpression } from '@nestjs/schedule';
 import { InjectRepository } from '@nestjs/typeorm';
+import { JobLockService } from '../jobs/job-lock.service';
 import { Lyrics } from '../lyrics/entities/lyrics.entity';
-import { matchGuess, normalizeAnswer } from './guess-matcher';
+import { matchGuess } from './guess-matcher';
 import { Genre, isGenre, toGenre } from '../lyrics/entities/genre.enum';
 import {
   In,
@@ -39,6 +45,8 @@ export interface RandomLyricOptions {
   decade?: string;
   genre?: string;
   excludeIds?: number[];
+  /** Session the round belongs to, when started from a multiplayer game. */
+  sessionId?: string;
   /**
    * When set, lyrics this player has already been served within the last
    * `seenWindowDays` days are excluded from the pool.
@@ -120,13 +128,6 @@ const ACTIVE_SESSION_STATUSES = [
   GameSessionStatus.IN_PROGRESS,
 ];
 
-/**
- * Name of the advisory lock guarding the daily `game_rounds` retention job.
- * The lock is taken with `pg_try_advisory_lock` so only one instance runs the
- * job at a time (see issue 43).
- */
-const GAME_ROUNDS_RETENTION_LOCK = 330_075;
-
 @Injectable()
 export class GameLogicService {
   private readonly logger = new Logger(GameLogicService.name);
@@ -140,6 +141,7 @@ export class GameLogicService {
     private sessionRepository: Repository<GameSession>,
     private readonly configService: ConfigService,
     private readonly events: EventEmitter2,
+    private readonly jobLockService: JobLockService,
   ) {}
 
   /** Seconds a player has to answer, configurable per deployment. */
@@ -167,16 +169,42 @@ export class GameLogicService {
   }
 
   /**
+   * Picks a lyric for this player and opens the round they can guess it in.
+   *
+   * This is the single entry point shared by the HTTP controller and the
+   * `/game` socket gateway, so both surfaces serve identical payloads.
+   */
+  async startRound(
+    userId: string,
+    options: RandomLyricOptions = {},
+  ): Promise<{ round: GameRound; lyric: GameLyric }> {
+    const lyric = await this.getRandomLyric({
+      ...options,
+      userId,
+      seenWindowDays: options.seenWindowDays ?? this.seenWindowDays,
+    });
+
+    const round = await this.issueRound(userId, lyric.id, options.sessionId);
+
+    return { round, lyric };
+  }
+
+  /**
    * Records that a lyric has been served to a player, opening the one round
    * that player can guess it in.
    *
    * `issuedAt` is set here, from the server clock, and is what the answer
    * window is measured against when the guess arrives.
+   *
+   * Pass `dailyDate` (a `YYYY-MM-DD` string) to tag the round as belonging to
+   * the daily challenge for that date. Daily rounds are looked up by
+   * `(userId, dailyDate, lyricId)` so they can be reused across requests.
    */
   async issueRound(
     userId: string,
     lyricId: number,
     sessionId?: string,
+    dailyDate?: string,
   ): Promise<GameRound> {
     if (sessionId) {
       await this.assertActiveParticipant(userId, sessionId);
@@ -192,6 +220,7 @@ export class GameLogicService {
         userId,
         lyricId,
         sessionId: sessionId ?? null,
+        dailyDate: dailyDate ?? null,
         issuedAt,
         expiresAt,
         answerWindowSeconds: this.answerWindowSeconds,
@@ -226,46 +255,45 @@ export class GameLogicService {
    *   `game_history` holds the record; otherwise they are moved into the
    *   `game_rounds_archive` table.
    *
-   * A Postgres advisory lock ensures only one instance runs the job at a time.
+   * A Postgres advisory lock (via {@link JobLockService}) ensures only one
+   * instance runs the job at a time.
    */
   @Cron(CronExpression.EVERY_DAY_AT_3AM)
   async pruneGameRounds(): Promise<void> {
-    const acquired = await this.tryAcquireRetentionLock();
-    if (!acquired) {
-      this.logger.debug('game_rounds retention job already running elsewhere');
-      return;
-    }
+    await this.jobLockService.runExclusive('game-rounds-prune', async () => {
+      try {
+        const now = Date.now();
+        const seenCutoff = new Date(
+          now - this.seenWindowDays * 24 * 60 * 60 * 1000,
+        );
+        const retentionCutoff = new Date(
+          now - this.roundRetentionDays * 24 * 60 * 60 * 1000,
+        );
 
-    try {
-      const now = Date.now();
-      const seenCutoff = new Date(
-        now - this.seenWindowDays * 24 * 60 * 60 * 1000,
-      );
-      const retentionCutoff = new Date(
-        now - this.roundRetentionDays * 24 * 60 * 60 * 1000,
-      );
+        const unguessed = await this.roundRepository.delete({
+          closedAt: IsNull(),
+          issuedAt: LessThan(seenCutoff),
+        });
 
-      const unguessed = await this.roundRepository.delete({
-        closedAt: IsNull(),
-        issuedAt: LessThan(seenCutoff),
-      });
+        const archived = await this.archiveGuessedRounds(retentionCutoff);
 
-      const archived = await this.archiveGuessedRounds(retentionCutoff);
+        const deleted = await this.roundRepository.delete({
+          closedAt: LessThan(retentionCutoff),
+          issuedAt: LessThan(retentionCutoff),
+        });
 
-      const deleted = await this.roundRepository.delete({
-        closedAt: LessThan(retentionCutoff),
-        issuedAt: LessThan(retentionCutoff),
-      });
-
-      this.logger.log(
-        `game_rounds retention: deleted ${unguessed.affected ?? 0} unguessed, ` +
-          `archived ${archived} guessed, deleted ${deleted.affected ?? 0} archived`,
-      );
-    } catch (error) {
-      this.logger.error('game_rounds retention job failed', error as Error);
-    } finally {
-      await this.releaseRetentionLock();
-    }
+        this.logger.log(
+          `game_rounds retention: deleted ${unguessed.affected ?? 0} unguessed, ` +
+            `archived ${archived} guessed, deleted ${deleted.affected ?? 0} archived`,
+        );
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        this.logger.error(
+          `game_rounds retention job failed: ${message}`,
+          error instanceof Error ? error.stack : undefined,
+        );
+      }
+    });
   }
 
   /**
@@ -295,27 +323,11 @@ export class GameLogicService {
     return Array.isArray(result) ? result.length : 0;
   }
 
-  private async tryAcquireRetentionLock(): Promise<boolean> {
-    const rows: Array<{ locked: boolean }> =
-      await this.roundRepository.query(
-        'SELECT pg_try_advisory_lock($1) AS locked',
-        [GAME_ROUNDS_RETENTION_LOCK],
-      );
-    return rows[0]?.locked === true;
-  }
-
-  private async releaseRetentionLock(): Promise<void> {
-    await this.roundRepository.query(
-      'SELECT pg_advisory_unlock($1)',
-      [GAME_ROUNDS_RETENTION_LOCK],
-    );
-  }
-
   /**
    * Scores a guess against a round served to this player, and closes it.
    *
-   * The round is closed with a conditional update before the answer is looked
-   * at, so two concurrent guesses cannot both be scored and the answer the
+   * The round is closed with a conditional update before the answer is revealed,
+   * so two concurrent guesses cannot both be scored and the answer the
    * first one reveals cannot be replayed.
    *
    * A guess that arrives after the answer window is still evaluated, but earns
@@ -333,7 +345,11 @@ export class GameLogicService {
     }
 
     if (round.closedAt) {
-      throw new ConflictException('This round has already been guessed');
+      throw new DomainException(
+        ErrorCode.ROUND_ALREADY_GUESSED,
+        HttpStatus.CONFLICT,
+        'This round has already been guessed',
+      );
     }
 
     const now = new Date();
@@ -349,7 +365,11 @@ export class GameLogicService {
         speedBonus: 0,
         timedOut: true,
       });
-      throw new GoneException('This round has expired');
+      throw new DomainException(
+        ErrorCode.ROUND_EXPIRED,
+        HttpStatus.GONE,
+        'This round has expired',
+      );
     }
 
     const closed = await this.roundRepository.update(
@@ -358,7 +378,11 @@ export class GameLogicService {
     );
 
     if (!closed.affected) {
-      throw new ConflictException('This round has already been guessed');
+      throw new DomainException(
+        ErrorCode.ROUND_ALREADY_GUESSED,
+        HttpStatus.CONFLICT,
+        'This round has already been guessed',
+      );
     }
 
     const result = await this.checkGuess({
@@ -367,12 +391,35 @@ export class GameLogicService {
       guessValue: dto.guessValue,
     });
 
+    const lyric = await this.lyricsRepository.findOne({ where: { id: round.lyricId } });
     const score = scoreRound({
       basePoints: result.points ?? 0,
       isCorrect: result.isCorrect,
       elapsedMs: now.getTime() - round.issuedAt.getTime(),
       windowMs: round.answerWindowSeconds * 1000,
       hintsUsed: round.hintsUsed,
+      difficulty: lyric?.difficulty ?? 1,
+    });
+
+    await this.roundRepository.manager.transaction(async (manager) => {
+      const closed = await manager.update(
+        GameRound,
+        { id: round.id, closedAt: IsNull() },
+        { closedAt: now },
+      );
+      if (!closed.affected) {
+        throw new ConflictException('This round has already been guessed');
+      }
+      if (lyric) {
+        await recordReferralRound(manager, {
+          roundId: round.id,
+          userId,
+          lyricId: round.lyricId,
+          correctInTime: result.isCorrect && !score.timedOut,
+          elapsedMs: now.getTime() - round.issuedAt.getTime(),
+          snippet: lyric.lyricSnippet,
+        });
+      }
     });
 
     const scored: GuessResult = {
@@ -418,11 +465,19 @@ export class GameLogicService {
     }
 
     if (round.closedAt) {
-      throw new ConflictException('This round has already been guessed');
+      throw new DomainException(
+        ErrorCode.ROUND_ALREADY_GUESSED,
+        HttpStatus.CONFLICT,
+        'This round has already been guessed',
+      );
     }
 
     if (round.expiresAt.getTime() <= Date.now()) {
-      throw new GoneException('This round has expired');
+      throw new DomainException(
+        ErrorCode.ROUND_EXPIRED,
+        HttpStatus.GONE,
+        'This round has expired',
+      );
     }
 
     const maxHints = GAME_CONSTANTS.LIMITS.MAX_HINTS_PER_ROUND;
@@ -492,7 +547,7 @@ export class GameLogicService {
 
     const correctAnswer =
       dto.guessType === 'artist' ? lyric.artist : lyric.songTitle;
-    const isCorrect = matchGuess(dto.guessValue, correctAnswer);
+    const { isCorrect, points } = matchGuess(dto.guessValue, correctAnswer);
 
     return {
       isCorrect,
@@ -500,7 +555,7 @@ export class GameLogicService {
       explanation: isCorrect
         ? 'Correct!'
         : `The correct answer was "${correctAnswer}".`,
-      points: isCorrect ? GAME_CONSTANTS.SCORING.BASE_POINTS : 0,
+      points,
     };
   }
 

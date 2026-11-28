@@ -1,5 +1,9 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { EventEmitter2, OnEvent } from '@nestjs/event-emitter';
+import { InjectRepository } from '@nestjs/typeorm';
+import { Repository } from 'typeorm';
+import { Achievement } from './achievement.entity';
+import { UserAchievement } from './user-achievement.entity';
 
 /**
  * Achievement definition identifiers.
@@ -10,7 +14,16 @@ export type AchievementCode =
   | 'perfect_guess'
   | 'streak_5'
   | 'streak_10'
-  | 'speed_demon';
+  | 'speed_demon'
+  | 'daily_streak_7'
+  | 'daily_streak_30'
+  | 'daily_streak_100';
+
+const DAILY_STREAK_MILESTONES = [
+  { days: 7, code: 'daily_streak_7' },
+  { days: 30, code: 'daily_streak_30' },
+  { days: 100, code: 'daily_streak_100' },
+] as const;
 
 export interface AchievementDefinition {
   code: AchievementCode;
@@ -48,6 +61,11 @@ export const ACHIEVEMENT_DEFINITIONS: AchievementDefinition[] = [
     name: 'Speed Demon',
     description: 'Answer correctly in under 3 seconds.',
   },
+  ...DAILY_STREAK_MILESTONES.map(({ days, code }) => ({
+    code,
+    name: `${days}-Day Daily Challenge Streak`,
+    description: `Play the daily challenge on ${days} consecutive UTC days.`,
+  })),
 ];
 
 /** Threshold (ms) under which a correct answer counts as a fast answer. */
@@ -102,6 +120,7 @@ export interface GameplayEvent {
   correctAnswer?: boolean;
   /** Current consecutive-correct-answer streak after this event. */
   streak?: number;
+  bestDailyStreak?: number;
   /** A wager was won. */
   wagerWon?: boolean;
   /** Time taken to answer, in milliseconds. */
@@ -123,6 +142,52 @@ export interface RoundEndedEvent {
 export interface WagerSettledEvent {
   userId: string;
   won: boolean;
+}
+
+/**
+ * TypeORM-backed implementation of {@link AchievementsRepository}. Registered
+ * as the `AchievementsRepository` provider in `AchievementsModule` so the
+ * service can be injected wherever achievements are needed.
+ */
+@Injectable()
+export class TypeOrmAchievementsRepository implements AchievementsRepository {
+  constructor(
+    @InjectRepository(Achievement)
+    private readonly achievements: Repository<Achievement>,
+    @InjectRepository(UserAchievement)
+    private readonly userAchievements: Repository<UserAchievement>,
+  ) {}
+
+  async upsertDefinition(definition: AchievementDefinition): Promise<void> {
+    await this.achievements.upsert(
+      {
+        code: definition.code,
+        name: definition.name,
+        description: definition.description,
+      },
+      ['code'],
+    );
+  }
+
+  async findUnlockedCodes(userId: string): Promise<AchievementCode[]> {
+    const rows = await this.userAchievements.find({
+      where: { userId },
+      select: ['achievementCode'],
+    });
+    return rows.map((row) => row.achievementCode as AchievementCode);
+  }
+
+  async insertUnlock(userId: string, code: AchievementCode): Promise<boolean> {
+    const result = await this.userAchievements
+      .createQueryBuilder()
+      .insert()
+      .into(UserAchievement)
+      .values({ userId, achievementCode: code })
+      .orIgnore()
+      .returning(['achievementCode'])
+      .execute();
+    return (result.raw as unknown[]).length > 0;
+  }
 }
 
 @Injectable()
@@ -161,6 +226,14 @@ export class AchievementsService {
       streak: event.streak,
       answerTimeMs: event.answerTimeMs,
     });
+  }
+
+  @OnEvent('user.daily_streak', { async: true })
+  async onDailyStreak(event: {
+    userId: string;
+    bestDailyStreak: number;
+  }): Promise<void> {
+    await this.handleGameplayEvent(event);
   }
 
   /** Subscribe to `wager.settled` gameplay events. */
@@ -204,6 +277,12 @@ export class AchievementsService {
         if (event.streak >= milestone) {
           codes.push(code);
         }
+      }
+    }
+
+    for (const { days, code } of DAILY_STREAK_MILESTONES) {
+      if ((event.bestDailyStreak ?? 0) >= days) {
+        codes.push(code);
       }
     }
 

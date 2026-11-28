@@ -403,13 +403,27 @@ Each correct guess is meant to be worth 10 XP (`calculateXpGain`). **This is not
 
 - `POST /auth/signup { username (3–20 chars, letters/numbers/underscore), email, password (8–72 chars, upper+lower+digit) }`: the password is hashed with bcrypt (12 rounds), email and username are lowercased/trimmed, and the response is `{ accessToken, refreshToken, user }`.
 - `POST /auth/login { email, password }`: updates `lastLoginAt` and returns `{ accessToken, refreshToken, user }`.
+- `POST /auth/stellar/login { transaction }`: logs in with a linked wallet and returns the same `{ accessToken, refreshToken, user }` shape as the password flow.
 - `POST /auth/refresh { refreshToken }`: exchanges a valid refresh token for a new `{ accessToken, refreshToken }` pair. The presented refresh token is revoked as part of the rotation.
 - `POST /auth/logout { refreshToken }`: revokes a single refresh token.
 - `POST /auth/change-password { currentPassword, newPassword }` (authenticated): changes the password, bumps the user's `tokenVersion` (invalidating every outstanding access token) and revokes all of the user's refresh tokens.
 
-Access tokens are HS256 JWTs signed with `JWT_SECRET`, valid for `JWT_EXPIRES_IN` (default `15m`). The payload is `{ sub: userId, email, username, role, tokenVersion }`; `JwtStrategy` rejects a token whose `tokenVersion` no longer matches the user's. Send the token as `Authorization: Bearer <token>`.
+Every signup, login and wallet login records the session's user agent, the client IP (truncated) and an optional `deviceName`, so the new device shows up in `GET /auth/sessions`.
+
+Access tokens are HS256 JWTs signed with `JWT_SECRET`, valid for `JWT_EXPIRES_IN` (default `15m`), and include the configured `JWT_ISSUER` and `JWT_AUDIENCE` claims. Verification pins the algorithm to HS256 and rejects mismatched issuer or audience. Each token has a `kid` derived from its signing key so the service can choose the correct key. The payload is `{ sub: userId, email, username, role, tokenVersion }`; `JwtStrategy` rejects a token whose `tokenVersion` no longer matches the user's. Send the token as `Authorization: Bearer <token>`.
+
+#### Rotating the access-token signing key
+
+1. Deploy the version that supports `JWT_SECRET_PREVIOUS` to every instance while keeping `JWT_SECRET` unchanged. This allows all instances to verify tokens with the same key before rotation begins.
+2. Coordinate a configuration rollout that sets `JWT_SECRET` to the new random value and `JWT_SECRET_PREVIOUS` to the former value on every serving instance. During this step, ensure instances using only the old secret are drained before new-key tokens are issued; old-only instances cannot verify tokens signed by the new key.
+3. Keep `JWT_SECRET_PREVIOUS` configured for at least the maximum `JWT_EXPIRES_IN` lifetime of tokens signed by the former key. Then remove it. Tokens with the former key remain valid only until their normal expiration.
 
 Refresh tokens are opaque random values returned once and stored server-side only as a SHA-256 hash (`refresh_tokens` table), each valid for 30 days unless revoked sooner by `/auth/logout`, a refresh (rotation revokes the token that was presented), or a password change.
+
+Rotation is **atomic**: the presented token is revoked with a conditional `UPDATE … WHERE revoked_at IS NULL`, and a new pair is issued only if that update affected a row. Two parallel refreshes with the same token therefore produce exactly one new pair. Each refresh token also carries a `familyId`. If a token that has already been rotated is presented again, the whole family is revoked, the user's `tokenVersion` is bumped (signing out every session) and a security audit event is written.
+
+Password-like fields never reach the audit log: `AuditInterceptor` runs the recursive, pattern-based `redact()` from `src/common/utils/redact.util.ts`, which case-insensitively matches keys such as `password`, `currentPassword`, `newPassword`, `token`, `secret`, `xdr`/`transaction`, `authorization` and `seed` at any depth and replaces their values with `***REDACTED***`. A migration scrubs those fields from any `audit_logs.payload` rows written before the fix.
+=======
 
 ### Stellar wallets (SEP-10)
 
@@ -429,7 +443,7 @@ sequenceDiagram
         S-->>C: { stellarAddress, verifiedAt }
     else log in with the wallet alone
         C->>S: POST /auth/stellar/login { transaction }
-        S-->>C: { accessToken, user }   (same JWT as the password flow)
+        S-->>C: { accessToken, refreshToken, user }   (same tokens as the password flow)
     end
 ```
 
@@ -710,10 +724,14 @@ All configuration comes from environment variables, loaded from `.env` by `@nest
 | `PORT`           | `3000`                   | HTTP port                                                             |
 | `HOST`           | `0.0.0.0`                | Interface to listen on. All interfaces by default, so the port works from inside a container; `127.0.0.1` for local-only. The bound address is logged at startup |
 | `NODE_ENV`       | `development`            | `production` hides validation messages and database error details, drops the mock notification endpoints, and enables the production safety checks below. Set it explicitly in every deployed environment |
-| `FRONTEND_URL`   | `http://localhost:3000`  | CORS origin. In production it must be a real origin, not a default or localhost value |
+| `FRONTEND_URL`   | `http://localhost:3000`  | Comma-separated CORS origins. In production each must be a real origin, not a default or localhost value |
 | `LOG_LEVEL`      | `info` in production, `debug` otherwise | Winston level: `error`, `warn`, `info`, `http`, `verbose` or `debug`. Nest's `log` is accepted and treated as `info` |
 | `JWT_SECRET`     | **required**             | The app refuses to start without it, and it must be at least 32 characters in every environment except `test`. Use a long random value |
+| `JWT_SECRET_PREVIOUS` | unset               | Optional former signing key accepted until its tokens expire; see the key-rotation procedure above |
+| `JWT_ISSUER`     | `lyricsflip`             | Required issuer claim checked on HTTP and WebSocket authentication |
+| `JWT_AUDIENCE`   | `lyricsflip-api`         | Required audience claim checked on HTTP and WebSocket authentication |
 | `JWT_EXPIRES_IN` | `15m`                    | Any format accepted by `jsonwebtoken`. Refresh tokens are separate, opaque and valid for 30 days |
+| `WS_ALLOW_NO_ORIGIN` | `true`               | Allow WebSocket clients with no `Origin` header; set to `false` to reject them. Logged at startup |
 | `SWAGGER_ENABLED` | `false` in production, `true` otherwise | Serves Swagger UI at `/api/docs`. In production it must be set explicitly; leaving it unset fails the boot |
 | `INVITATION_TTL_MINUTES` | `30`             | How long player two has to accept a session invitation before it is abandoned and player one refunded |
 
@@ -791,10 +809,10 @@ Swagger at `/api/docs` (when `SWAGGER_ENABLED` is on) has the request and respon
 
 | Method & path                   | Access | Body                                   | Returns                            |
 | ------------------------------- | ------ | -------------------------------------- | ---------------------------------- |
-| `POST /auth/signup`             | public | `{ username, email, password }`        | `{ accessToken, user }`            |
-| `POST /auth/login`              | public | `{ email, password }`                  | `{ accessToken, user }`            |
+| `POST /auth/signup`             | public | `{ username, email, password }`        | `{ accessToken, refreshToken, user }` |
+| `POST /auth/login`              | public | `{ email, password }`                  | `{ accessToken, refreshToken, user }` |
 | `POST /auth/stellar/challenge`  | public | `{ account: "G..." }`                  | `{ transaction, network_passphrase, server_account_id }` |
-| `POST /auth/stellar/login`      | public | `{ transaction }` (signed)             | `{ accessToken, user }`            |
+| `POST /auth/stellar/login`      | public | `{ transaction }` (signed)             | `{ accessToken, refreshToken, user }` |
 | `POST /auth/stellar/link`       | auth   | `{ transaction }` (signed)             | `{ stellarAddress, verifiedAt }`   |
 | `GET /auth/stellar/wallet`      | auth   | –                                      | `{ stellarAddress, verifiedAt }`   |
 | `DELETE /auth/stellar/wallet`   | auth   | –                                      | `{ message }`                      |
@@ -935,7 +953,7 @@ Writes update the per-ID entry. Broader invalidation (`clearCache`) is currently
 
 ## Logging and errors
 
-- `LoggingInterceptor` logs every request and response, with method, URL, status and duration. Top-level `password`, `token`, `secret`, `key` and `authorization` fields are redacted.
+- `LoggingInterceptor` logs every request and response, with method, URL, status and duration. Top-level `password`, `token`, `secret`, `key` and `authorization` fields are redacted. `AuditInterceptor` uses the stricter recursive `redact()` described in [Audit logging](#audit-logging).
 - `AllExceptionsFilter` gives errors the shape shown in [Request lifecycle](#request-lifecycle) and logs them with context.
 - TypeORM logs queries and errors, and warns about queries slower than 250 ms.
 - `src/common/services/logger.service.ts` provides a Winston logger with daily-rotating files, but it is not yet registered as the app logger (issue #114).
@@ -956,13 +974,14 @@ All date columns are `timestamptz` and connections pin `timezone=UTC`.
 
 ## Audit logging
 
-Admin and settlement actions leave a durable row in `audit_logs` (actor, action, target type/ID, a sanitized request payload, IP and timestamp), so disputes over a deletion or a settlement can be resolved against a record instead of guesswork.
+Admin and settlement actions leave a durable row in `audit_logs` (actor, action, target type/ID, a sanitized request payload, IP and timestamp), so disputes over a deletion or a settlement can be resolved against a record instead of guesswork. The payload is sanitized with the recursive, pattern-based `redact()` (`src/common/utils/redact.util.ts`): any key matching `/pass(word)?/`, `/token/`, `/secret/`, `/xdr|transaction/`, `/authorization/` or `/seed/`, case-insensitively and at any depth, is stored as `***REDACTED***`. That includes `currentPassword` and `newPassword` on `POST /auth/change-password`.
 
 A handler opts in with `@Audited({ action, targetType })`, on a controller that also has `@UseInterceptors(AuditInterceptor)`; `AuditInterceptor` writes the row after the handler succeeds (never on a failed request) and never blocks or fails the response if the write itself fails. Currently applied to:
 
 - `DELETE /admin/users/:id`, `DELETE /admin/lyrics/:id`
 - `PUT /game-sessions/:id/complete-wagered`, `POST /game-sessions/:id/wager/reconcile`
 - `POST /auth/stellar/link`, `DELETE /auth/stellar/wallet`
+- `POST /auth/change-password` (both password fields are redacted in the stored payload)
 
 `GET /admin/audit-logs` (admin-only) lists rows with `actorId`, `action`, `targetType`, `targetId`, `limit` and `offset` filters. There is no write or delete endpoint - the table is append-only from the API's perspective; only direct database access can alter a row.
 
@@ -1054,3 +1073,29 @@ Do not run stellar mode with real value until the P0 issues are closed.
 
 <!-- handsoff-issue-336 -->
 - #336: [R2-81] Friends and direct challenges (first-round #94, never implemented)
+
+<!-- handsoff-issue-456 -->
+- #456: [R3-34] Plaintext passwords are written to `audit_logs` again
+
+<!-- handsoff-issue-458 -->
+- #458: [R3-36] Login and signup never return a refresh token, so `/auth/refresh` cannot be reached
+
+<!-- handsoff-issue-459 -->
+- #459: [R3-37] Refresh-token rotation can be raced, and token reuse goes undetected
+
+<!-- handsoff-issue-540 -->
+- #540: [R3-118] Anti-cheat signals: impossible answer speed and lookup patterns
+
+<!-- handsoff-issue-542 -->
+- #542: [R3-120] Themed lyric packs
+<!-- handsoff-issue-532 -->
+- #532: [R3-110] Quick match: a matchmaking queue for head-to-head
+
+<!-- handsoff-issue-533 -->
+- #533: [R3-111] Ranked and casual modes
+
+<!-- handsoff-issue-534 -->
+- #534: [R3-112] Seasons, with seasonal leaderboards and rewards
+
+<!-- handsoff-issue-535 -->
+- #535: [R3-113] Multi-round rooms with a host-controlled round loop

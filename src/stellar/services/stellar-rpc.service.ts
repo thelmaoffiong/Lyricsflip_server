@@ -1,3 +1,4 @@
+import { runtimeEnv } from '../../config/runtime-env';
 import {
   Inject,
   Injectable,
@@ -21,12 +22,13 @@ import {
   TRANSACTION_TIMEOUT_SECONDS,
 } from '../stellar.constants';
 import type { StellarConfig } from '../stellar.config';
+import { Span, SpanStatusCode } from '@opentelemetry/api';
 import { MetricsService } from '../../metrics/metrics.service';
-import { getTracer, SpanStatusCode, type Span } from '../../tracing';
+import { getTracer } from '../../tracing';
 
 /** Reads a non-negative integer from the environment, with a default. */
 function envInt(name: string, fallback: number): number {
-  const parsed = Number.parseInt(process.env[name] ?? '', 10);
+  const parsed = Number.parseInt(runtimeEnv()[name] ?? '', 10);
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
 }
 
@@ -144,7 +146,7 @@ export class StellarRpcService {
 
   /** Fee ceiling in stroops, from `STELLAR_MAX_FEE` (default 0.1 XLM). */
   get maxFee(): bigint {
-    const raw = process.env.STELLAR_MAX_FEE;
+    const raw = runtimeEnv().STELLAR_MAX_FEE;
     return raw && /^\d+$/.test(raw) && BigInt(raw) > 0n
       ? BigInt(raw)
       : BigInt(DEFAULT_MAX_FEE);
@@ -431,6 +433,100 @@ export class StellarRpcService {
       span.setAttribute('attempt_count', polls);
       span.end();
     }
+  }
+
+  /**
+   * Looks up a transaction by hash. Returns `null` when the network has no
+   * record of it, which is the normal state for a transaction that has not
+   * been included yet.
+   */
+  async lookupTransaction(hash: string): Promise<SubmitResult | null> {
+    const span: Span = getTracer('stellar-rpc').startSpan(
+      'StellarRpcService.lookupTransaction',
+      { attributes: { 'transaction.hash': hash, transaction_hash: hash } },
+    );
+    try {
+      const status = await this.server.getTransaction(hash);
+      if (status.status === 'SUCCESS') {
+        span.setAttribute('confirmed', true);
+        span.setAttribute('ledger', status.ledger);
+        return {
+          hash,
+          confirmed: true,
+          ledger: status.ledger,
+          returnValue: status.returnValue
+            ? scValToNative(status.returnValue)
+            : undefined,
+        };
+      }
+      if (status.status === 'FAILED') {
+        span.setAttribute('confirmed', false);
+        span.setStatus({ code: SpanStatusCode.ERROR, message: 'FAILED' });
+        return {
+          hash,
+          confirmed: false,
+          ledger: status.ledger,
+          error: `Transaction failed on-chain: ${JSON.stringify(status.resultXdr ?? '')}`,
+        };
+      }
+      span.setAttribute('confirmed', false);
+      return null;
+    } catch (error) {
+      span.recordException(error as Error);
+      span.setStatus({
+        code: SpanStatusCode.ERROR,
+        message: (error as Error).message,
+      });
+      this.logger.warn(
+        `Lookup of transaction ${hash} failed: ${(error as Error).message}`,
+      );
+      return null;
+    } finally {
+      span.end();
+    }
+  }
+
+  /**
+   * Reports whether the RPC endpoint is reachable and serving the expected
+   * network. Used by the readiness probe and `GET /stellar/health`.
+   */
+  async isHealthy(): Promise<boolean> {
+    try {
+      const health = await this.server.getHealth();
+      return health.status === 'healthy';
+    } catch (error) {
+      this.logger.warn(
+        `Stellar RPC health check failed: ${(error as Error).message}`,
+      );
+      return false;
+    }
+  }
+
+  /**
+   * Fee actually charged for a confirmed transaction, in stroops, read from
+   * the ledger meta. Returns `null` when the fee cannot be determined.
+   */
+  async feeCharged(hash: string): Promise<bigint | null> {
+    try {
+      const status = await this.server.getTransaction(hash);
+      if (status.status !== 'SUCCESS') return null;
+      const meta = status.resultMetaXdr;
+      if (!meta) return null;
+      const feeCharged = (meta as { feeCharged?: () => bigint | number | string })
+        .feeCharged;
+      if (typeof feeCharged !== 'function') return null;
+      return BigInt(feeCharged.call(meta));
+    } catch (error) {
+      this.logger.warn(
+        `Could not read fee charged for ${hash}: ${(error as Error).message}`,
+      );
+      return null;
+    }
+  }
+
+  /** Promise-based delay, used for backoff between RPC attempts. */
+  sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
   /** Hex-encoded transaction hash. */

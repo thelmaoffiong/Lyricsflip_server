@@ -83,6 +83,19 @@ export class Wager {
   @Column({ type: 'bigint' })
   totalPotStroops: string;
 
+  /**
+   * Alias of {@link stakeStroops} for callers written against the older
+   * `stake` field name. Not a separate column: it maps to `stakeStroops` so
+   * the entity stays the single source of truth for the pot amount.
+   */
+  get stake(): string {
+    return this.stakeStroops;
+  }
+
+  set stake(value: string) {
+    this.stakeStroops = value;
+  }
+
   @Column({
     type: 'enum',
     enum: WagerStatus,
@@ -141,6 +154,17 @@ export class Wager {
   /** Hash of player B's stake transaction. */
   @Column({ type: 'varchar', length: 128, nullable: true })
   playerBStakeTxHash?: string | null;
+
+  /**
+   * Hash of a stake transaction player A submitted that did not (yet)
+   * confirm. Kept only for reconciliation — it does not count as a stake.
+   */
+  @Column({ type: 'varchar', length: 128, nullable: true })
+  playerAPendingStakeHash?: string | null;
+
+  /** Hash of player B's submitted but unconfirmed stake transaction. */
+  @Column({ type: 'varchar', length: 128, nullable: true })
+  playerBPendingStakeHash?: string | null;
 
   /**
    * Hash of the most recently built (but not necessarily signed) stake

@@ -6,10 +6,23 @@ import { IoAdapter } from '@nestjs/platform-socket.io';
 import { Test } from '@nestjs/testing';
 import { getRepositoryToken } from '@nestjs/typeorm';
 import { io, Socket } from 'socket.io-client';
+import { GameGateway } from '../src/game/game.gateway';
+import { GameLogicService } from '../src/game/game.service';
 import { GameSession } from '../src/game-sessions/entities/game-session.entity';
 import { RoomUser } from '../src/rooms/entities/room-user.entity';
 import { RealtimeGateway } from '../src/realtime/realtime.gateway';
 import { RealtimeEvent } from '../src/realtime/realtime.events';
+import { SocketAuthenticator } from '../src/auth/socket-authenticator';
+import { jwtKeyId } from '../src/auth/jwt-key.util';
+
+const jwtConfig = (secret: string) => ({
+  get: (name: string, fallback?: string) =>
+    ({
+      JWT_SECRET: secret,
+      JWT_ISSUER: 'lyricsflip',
+      JWT_AUDIENCE: 'lyricsflip-api',
+    })[name] ?? fallback,
+});
 
 describe('Realtime (e2e)', () => {
   const secret = 'e2e-secret';
@@ -25,7 +38,16 @@ describe('Realtime (e2e)', () => {
   const sockets: Socket[] = [];
 
   const connect = async (userId: string): Promise<Socket> => {
-    const token = await jwt.signAsync({ sub: userId }, { secret });
+    const token = await jwt.signAsync(
+      { sub: userId },
+      {
+        secret,
+        algorithm: 'HS256',
+        keyid: jwtKeyId(secret),
+        issuer: 'lyricsflip',
+        audience: 'lyricsflip-api',
+      },
+    );
     const socket = io(`${url}/realtime`, {
       auth: { token },
       transports: ['websocket'],
@@ -53,7 +75,8 @@ describe('Realtime (e2e)', () => {
       imports: [EventEmitterModule.forRoot(), JwtModule.register({})],
       providers: [
         RealtimeGateway,
-        { provide: ConfigService, useValue: { get: () => secret } },
+        SocketAuthenticator,
+        { provide: ConfigService, useValue: jwtConfig(secret) },
         {
           // alice and bob play this session; carol does not.
           provide: getRepositoryToken(GameSession),
@@ -118,6 +141,7 @@ describe('Realtime (e2e)', () => {
     ).resolves.toEqual({
       ok: false,
       error: 'Not found',
+      code: 'NOT_FOUND',
     });
 
     const carolHears = jest.fn();
@@ -179,5 +203,127 @@ describe('Realtime (e2e)', () => {
     expect(settledForAlice).toMatchObject({ outcome: 'won', winnerId: alice });
 
     expect(carolHears).not.toHaveBeenCalled();
+  });
+});
+
+describe('Game gateway (e2e)', () => {
+  const secret = 'e2e-secret';
+  const playerId = '9c4f5d6e-7a8b-4c93-9d0e-2f3a4b5c6d7e';
+  const roundId = '1d2e3f4a-5b6c-4d7e-8f90-1a2b3c4d5e6f';
+  const lyricId = '2e3f4a5b-6c7d-4e8f-9a01-2b3c4d5e6f70';
+  const expiresAt = new Date(Date.now() + 20_000);
+
+  let app: INestApplication;
+  let jwt: JwtService;
+  let url: string;
+  let socket: Socket;
+
+  const gameLogic = {
+    startRound: jest.fn(async () => ({
+      roundId,
+      lyricId,
+      sessionId: null,
+      issuedAt: new Date(),
+      expiresAt,
+      answerWindowSeconds: 20,
+    })),
+    submitGuess: jest.fn(async () => ({
+      isCorrect: true,
+      points: 140,
+      speedBonus: 40,
+      timedOut: false,
+      hintsUsed: 0,
+      correctLyricId: lyricId,
+    })),
+    requestHint: jest.fn(async () => ({
+      roundId,
+      hint: 'It starts with "S"',
+      hintsUsed: 1,
+      hintsRemaining: 2,
+      expiresAt,
+    })),
+  };
+
+  beforeAll(async () => {
+    const moduleRef = await Test.createTestingModule({
+      imports: [EventEmitterModule.forRoot(), JwtModule.register({})],
+      providers: [
+        GameGateway,
+        { provide: ConfigService, useValue: jwtConfig(secret) },
+        { provide: GameLogicService, useValue: gameLogic },
+      ],
+    }).compile();
+
+    app = moduleRef.createNestApplication();
+    app.useWebSocketAdapter(new IoAdapter(app));
+    await app.listen(0);
+    url = (await app.getUrl()).replace('[::1]', 'localhost');
+    jwt = app.get(JwtService);
+  });
+
+  afterAll(async () => {
+    socket?.close();
+    await app.close();
+  });
+
+  it('plays a round over the socket with HTTP-shaped payloads', async () => {
+    const token = await jwt.signAsync(
+      { sub: playerId },
+      {
+        secret,
+        algorithm: 'HS256',
+        keyid: jwtKeyId(secret),
+        issuer: 'lyricsflip',
+        audience: 'lyricsflip-api',
+      },
+    );
+    socket = io(`${url}/game`, {
+      auth: { token },
+      transports: ['websocket'],
+      forceNew: true,
+    });
+    await new Promise<void>((resolve, reject) => {
+      socket.once('connect', () => resolve());
+      socket.once('connect_error', reject);
+    });
+
+    const round = await socket.emitWithAck('requestLyric', {});
+    expect(gameLogic.startRound).toHaveBeenCalledWith(playerId, {});
+    expect(round).toMatchObject({
+      roundId,
+      lyricId,
+      answerWindowSeconds: 20,
+    });
+    expect(round.expiresAt).toBeDefined();
+    expect(new Date(round.expiresAt).getTime()).toBe(expiresAt.getTime());
+
+    const guess = await socket.emitWithAck('submitGuess', {
+      roundId,
+      guessType: 'title',
+      guessValue: 'Song',
+    });
+    expect(gameLogic.submitGuess).toHaveBeenCalledWith(playerId, {
+      roundId,
+      guessType: 'title',
+      guessValue: 'Song',
+    });
+    expect(guess).toMatchObject({
+      isCorrect: true,
+      points: 140,
+      speedBonus: 40,
+      timedOut: false,
+      hintsUsed: 0,
+      correctLyricId: lyricId,
+    });
+
+    const hint = await socket.emitWithAck('requestHint', { roundId });
+    expect(gameLogic.requestHint).toHaveBeenCalledWith(playerId, { roundId });
+    expect(hint).toMatchObject({
+      roundId,
+      hint: 'It starts with "S"',
+      hintsUsed: 1,
+      hintsRemaining: 2,
+    });
+    expect(hint.expiresAt).toBeDefined();
   });
 });

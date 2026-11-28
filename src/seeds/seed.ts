@@ -1,3 +1,4 @@
+import { runtimeEnv } from '../config/runtime-env';
 /**
  * Seed script — run with:  npm run seed
  *
@@ -27,11 +28,14 @@ config({ path: path.resolve(__dirname, '../../.env') });
 
 import { User } from '../users/entities/user.entity';
 import { Lyrics, Genre } from '../lyrics/entities/lyrics.entity';
-import { Role } from '../auth/roles/role.enum';
 import {
   buildDataSourceOptions,
   envFromRecord,
 } from '../config/database.config';
+
+// Role values as stored in the database (see users entity / role enum).
+const ROLE_USER = 'user';
+const ROLE_ADMIN = 'admin';
 
 // ---------------------------------------------------------------------------
 // Fixture data
@@ -42,17 +46,19 @@ const seedData: Array<{
   songTitle: string;
   genre: string;
   category?: string;
-  aliases?: string[];
+  artistAliases?: string[];
+  titleAliases?: string[];
   decade: string;
   difficulty: number;
   content: string;
   lyricSnippet: string;
 }> = require('./seed-data.json');
 
-// Load-test volume (issue R2-117). Enabled only when LOAD_SEED=1 so the
-// default fixture seed is unaffected.
-const LOAD_SEED_LYRICS = parseInt(process.env.LOAD_SEED_LYRICS ?? '100000', 10);
-const LOAD_SEED_USERS = parseInt(process.env.LOAD_SEED_USERS ?? '10000', 10);
+// Load-test volume (issue R2-117). Opt-in: only seeded when
+// LOAD_SEED_LYRICS is set to a positive integer, so the default fixture
+// seed is unaffected.
+const LOAD_SEED_LYRICS = parseInt(runtimeEnv().LOAD_SEED_LYRICS ?? '0', 10);
+const LOAD_SEED_USERS = parseInt(runtimeEnv().LOAD_SEED_USERS ?? '0', 10);
 const GENRES = [Genre.Afrobeats, Genre.HipHop, Genre.Pop, Genre.Other];
 
 // Sample players used for local head-to-head / wager testing.
@@ -90,10 +96,10 @@ const samplePlayers: Array<{
 // Guard: refuse to run in production without explicit credentials
 // ---------------------------------------------------------------------------
 function resolveCredentials(): { email: string; password: string } {
-  const email = process.env.SEED_ADMIN_EMAIL;
-  const password = process.env.SEED_ADMIN_PASSWORD;
+  const email = runtimeEnv().SEED_ADMIN_EMAIL;
+  const password = runtimeEnv().SEED_ADMIN_PASSWORD;
 
-  if (process.env.NODE_ENV === 'production') {
+  if (runtimeEnv().NODE_ENV === 'production') {
     if (!email || !password) {
       console.error(
         'ERROR: SEED_ADMIN_EMAIL and SEED_ADMIN_PASSWORD must be set ' +
@@ -115,7 +121,7 @@ function resolveCredentials(): { email: string; password: string } {
 function buildDataSource(): DataSource {
   try {
     return new DataSource({
-      ...buildDataSourceOptions(envFromRecord(process.env), {
+      ...buildDataSourceOptions(envFromRecord(runtimeEnv()), {
         entities: [User, Lyrics],
       }),
       logging: false,
@@ -143,7 +149,7 @@ function toGenre(raw: string): Genre {
 // Load-test seeding (issue R2-117): bulk users and lyrics in batches.
 // bcrypt cost 4 is used only for load fixtures, never for real accounts.
 // ---------------------------------------------------------------------------
-async function seedLoadData(dataSource: DataSource, adminId: number): Promise<void> {
+async function seedLoadData(dataSource: DataSource, adminId: string): Promise<void> {
   const userRepo = dataSource.getRepository(User);
   const lyricsRepo = dataSource.getRepository(Lyrics);
   const BATCH = 1000;
@@ -157,7 +163,7 @@ async function seedLoadData(dataSource: DataSource, adminId: number): Promise<vo
         username: `load_user_${i}`,
         name: `Load User ${i}`,
         passwordHash,
-        role: Role.Player,
+        role: ROLE_USER,
       });
     }
     await userRepo.createQueryBuilder().insert().values(rows).orIgnore().execute();
@@ -174,6 +180,8 @@ async function seedLoadData(dataSource: DataSource, adminId: number): Promise<vo
         genre: GENRES[i % GENRES.length],
         decade: '2010s',
         difficulty: (i % 5) + 1,
+        source: 'seed',
+        addedBy: 'seed',
         createdBy: { id: adminId },
       });
     }
@@ -204,14 +212,14 @@ export async function bootstrap() {
       username: 'seedadmin',
       name: 'Seed Admin',
       passwordHash: hashedPassword,
-      role: Role.Admin,
+      role: ROLE_ADMIN,
     });
     admin = await userRepo.save(admin);
     console.log(`Created admin user: ${email}`);
   } else {
     // Ensure role is set even if the row already existed without it
-    if (admin.role !== Role.Admin) {
-      admin.role = Role.Admin;
+    if (admin.role !== ROLE_ADMIN) {
+      admin.role = ROLE_ADMIN;
       await userRepo.save(admin);
       console.log(`Updated existing user to admin role: ${email}`);
     } else {
@@ -237,13 +245,25 @@ export async function bootstrap() {
         exists.category = entry.category;
         changed = true;
       }
-      if (entry.aliases !== undefined) {
-        const current = JSON.stringify(exists.aliases ?? []);
-        const next = JSON.stringify(entry.aliases);
+      if (entry.artistAliases !== undefined) {
+        const current = JSON.stringify(exists.artistAliases ?? []);
+        const next = JSON.stringify(entry.artistAliases);
         if (current !== next) {
-          exists.aliases = entry.aliases;
+          exists.artistAliases = entry.artistAliases;
           changed = true;
         }
+      }
+      if (entry.titleAliases !== undefined) {
+        const current = JSON.stringify(exists.titleAliases ?? []);
+        const next = JSON.stringify(entry.titleAliases);
+        if (current !== next) {
+          exists.titleAliases = entry.titleAliases;
+          changed = true;
+        }
+      }
+      if (exists.source !== 'seed') {
+        exists.source = 'seed';
+        changed = true;
       }
       if (changed) {
         await lyricsRepo.save(exists);
@@ -262,7 +282,8 @@ export async function bootstrap() {
         artist: entry.artist,
         genre: toGenre(entry.genre),
         category: entry.category,
-        aliases: entry.aliases ?? [],
+        artistAliases: entry.artistAliases ?? [],
+        titleAliases: entry.titleAliases ?? [],
         decade: entry.decade,
         difficulty: entry.difficulty,
         createdBy: { id: admin.id },
@@ -278,7 +299,7 @@ export async function bootstrap() {
   // ------------------------------------------------------------------
   // 3. Upsert sample players (development only)
   // ------------------------------------------------------------------
-  if (process.env.NODE_ENV === 'production') {
+  if (runtimeEnv().NODE_ENV === 'production') {
     console.log('Skipping sample players: NODE_ENV=production.');
   } else {
     for (const p of samplePlayers) {
@@ -289,7 +310,7 @@ export async function bootstrap() {
           username: p.username,
           name: p.name,
           passwordHash: await bcrypt.hash(p.password, 12),
-          role: Role.User,
+          role: ROLE_USER,
           walletAddress: p.testnetAddress,
         });
         await userRepo.save(player);
@@ -307,7 +328,7 @@ export async function bootstrap() {
     }
   }
 
-  if (process.env.LOAD_SEED === '1') {
+  if (LOAD_SEED_LYRICS > 0) {
     await seedLoadData(dataSource, admin.id);
   }
   console.log('Seeding complete.');

@@ -1,10 +1,28 @@
+import { runtimeEnv } from './config/runtime-env';
+import {
+  DomainException,
+  ErrorCode,
+} from './common/exceptions/domain.exception';
 import {
   ClassSerializerInterceptor,
   INestApplication,
+  HttpStatus,
+  HttpException,
   ValidationPipe,
+  type ValidationError,
 } from '@nestjs/common';
 import { Reflector } from '@nestjs/core';
 import { json, urlencoded } from 'express';
+import { allowedOrigins } from './common/security/cors';
+
+/**
+ * Global route prefix.
+ *
+ * URI versioning is enabled in app.openapi.ts, so Nest appends the version
+ * segment after this prefix. Keeping the prefix at `api` (not `api/v1`)
+ * yields `/api/v1/...` and avoids a duplicated `/api/v1/v1/...` segment.
+ */
+export const API_GLOBAL_PREFIX = 'api';
 
 /**
  * Global request validation and response serialization.
@@ -13,12 +31,35 @@ import { json, urlencoded } from 'express';
  * production does.
  */
 export function configureApp(app: INestApplication): void {
+  const validationOptions = {
+    whitelist: true,
+    forbidNonWhitelisted: true,
+    transform: true,
+    disableErrorMessages: process.env.NODE_ENV === 'production',
+  };
+  const defaultExceptionFactory = new ValidationPipe(
+    validationOptions,
+  ).createExceptionFactory() as (errors: ValidationError[]) => HttpException;
   app.useGlobalPipes(
     new ValidationPipe({
+      ...validationOptions,
+      exceptionFactory: (errors) => {
+        const exception = defaultExceptionFactory(errors);
+        const body = exception.getResponse();
+        const message =
+          typeof body === 'string'
+            ? body
+            : (body as { message: string | string[] }).message;
+        return new DomainException(
+          ErrorCode.VALIDATION_ERROR,
+          HttpStatus.BAD_REQUEST,
+          message,
+        );
+      },
       whitelist: true,
       forbidNonWhitelisted: true,
       transform: true,
-      disableErrorMessages: process.env.NODE_ENV === 'production',
+      disableErrorMessages: runtimeEnv().NODE_ENV === 'production',
     }),
   );
 
@@ -39,7 +80,8 @@ export function configureApp(app: INestApplication): void {
   // CORS must be registered before the HTTP adapter starts listening,
   // otherwise the configuration is never applied to the running server.
   app.enableCors({
-    origin: parseAllowedOrigins(process.env.FRONTEND_URL),
+    origin: allowedOrigins(),
+    origin: parseAllowedOrigins(runtimeEnv().FRONTEND_URL),
     credentials: true,
   });
 }
@@ -48,19 +90,11 @@ export function configureApp(app: INestApplication): void {
  * Resolves a body limit from the environment, falling back to a default.
  */
 export function getBodyLimit(envVar: string, fallback: string): string {
-  const value = process.env[envVar]?.trim();
+  const value = runtimeEnv()[envVar]?.trim();
   return value && value.length > 0 ? value : fallback;
 }
 
-/**
- * Parses FRONTEND_URL into a list of allowed origins.
- *
- * Supports a single origin or a comma-separated list, e.g.
- * "https://app.example.com,https://admin.example.com".
- */
+/** Backwards-compatible parser; app configuration uses the shared helper. */
 export function parseAllowedOrigins(frontendUrl?: string): string[] {
-  return (frontendUrl ?? '')
-    .split(',')
-    .map((origin) => origin.trim())
-    .filter((origin) => origin.length > 0);
+  return allowedOrigins(frontendUrl ?? '');
 }

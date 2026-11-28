@@ -13,6 +13,8 @@ export enum SettlementStatus {
   PENDING_SIGNATURE = 'pending_signature',
   /** Submitted to the network, outcome not yet known. */
   SUBMITTED = 'submitted',
+  /** Alias of {@link SUBMITTED}, kept for call sites that use the shorter name. */
+  SUBMIT = 'submitted',
   /** Included in a ledger and successful. */
   CONFIRMED = 'confirmed',
   /** Rejected by the network or reverted by the contract. */
@@ -91,11 +93,15 @@ export interface ITokenService {
    * Submits a stake transaction that a player's wallet signed.
    * @param userId The player submitting it; the envelope must be their stake.
    * @param signedXdr Base64 transaction envelope returned by the wallet.
+   * @param expectedHash Hash of the latest stake transaction offered to this
+   *   player. Implementations must reject a mismatching envelope with a
+   *   `BadRequestException` before submitting anything to the network.
    */
   confirmStake(
     userId: string,
     signedXdr: string,
     context: EscrowContext,
+    expectedHash?: string | null,
   ): Promise<TokenTransactionResult>;
 
   /** Releases the whole pot to the winner. */

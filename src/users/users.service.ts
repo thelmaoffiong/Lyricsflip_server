@@ -1,3 +1,6 @@
+import { lockPlayerPair, orderedPlayers } from '../social/player-pair';
+import { submitPlayerReport } from '../moderation/player-report.store';
+import { CreatePlayerReportDto } from '../moderation/player-report.dto';
 import {
   Injectable,
   BadRequestException,
@@ -11,7 +14,6 @@ import { CACHE_MANAGER } from '@nestjs/cache-manager';
 import { InjectRepository } from '@nestjs/typeorm';
 import { In, Not, Raw, Repository } from 'typeorm';
 import * as bcrypt from 'bcrypt';
-import { UpdateUserDto } from './dto/update-user.dto';
 import { UpdateUserPreferencesDto } from './dto/update-user-preferences.dto';
 import { User } from './entities/user.entity';
 import { Cache } from 'cache-manager';
@@ -24,9 +26,12 @@ import { fromStroops } from '../stellar/amount.util';
 import { GameHistory } from '../game-history/entities/game-history.entity';
 import { GameRound } from '../game/entities/game-round.entity';
 import { DailyChallengeAttempt } from '../challenges/entities/daily-challenge-attempt.entity';
+import { currentDailyStreak } from '../challenges/daily-seed.util';
 import { Room } from '../rooms/entities/room.entity';
 import { RoomUser } from '../rooms/entities/room-user.entity';
 import { Lyrics } from '../lyrics/entities/lyrics.entity';
+import { Role } from '../auth/roles/role.enum';
+import { UserBlock } from '../moderation/user-block.entity';
 import { usernameRuleViolation } from '../common/validators/username.validator';
 
 // Wager states that have not yet reached a final outcome. A user involved in
@@ -40,7 +45,6 @@ const NON_TERMINAL_WAGER_STATUSES = [
 ];
 import { AdminUpdateUserDto, UpdateProfileDto } from './dto/update-user.dto';
 import { MAX_PAGE_SIZE } from '../common/dto/pagination-query.dto';
-import { cacheConfig } from '../config/cache.config';
 import { Optional } from '@nestjs/common';
 import { PublicUserDto } from './dto/public-user.dto';
 import { AchievementsService } from '../achievements/achievements.service';
@@ -54,7 +58,9 @@ import { PasswordResetToken } from '../auth/entities/password-reset-token.entity
 import { Notification } from '../notifications/entities/notification.entity';
 import { AuditLog } from '../audit/entities/audit-log.entity';
 import { DeleteAccountDto } from './dto/delete-account.dto';
+import { StellarAuthService } from '../auth/services/stellar-auth.service';
 import { StellarAuthService } from '../auth/stellar-auth.service';
+import { isVerifiedEmailRequired } from '../auth/verified-email.util';
 
 /** Public profiles are cached briefly; they change only after a match. */
 const PUBLIC_PROFILE_CACHE_TTL_MS = 60_000;
@@ -64,6 +70,12 @@ const TOKEN_SYMBOL = 'LYRIC';
 export type LeaderboardPeriod = 'weekly' | 'monthly' | 'all';
 
 const LEADERBOARD_PERIODS: LeaderboardPeriod[] = ['weekly', 'monthly', 'all'];
+
+export interface LeaderboardOptions {
+  limit?: number;
+  offset?: number;
+  period?: LeaderboardPeriod;
+}
 
 @Injectable()
 export class UsersService {
@@ -149,6 +161,34 @@ export class UsersService {
     return profile;
   }
 
+  async getReferrals(userId: string) {
+    const [user, referredSignups, rewards] = await Promise.all([
+      this.userRepository.findOneOrFail({
+        where: { id: userId },
+        select: { referralCode: true },
+      }),
+      this.userRepository.countBy({ referredBy: userId }),
+      this.userRepository.query<Array<{ awardedAt: Date }>>(
+        `SELECT "awardedAt" FROM referral_rewards
+         WHERE "referrerId" = $1 OR "referredId" = $1
+         ORDER BY "awardedAt" DESC LIMIT 1`,
+        [userId],
+      ),
+    ]);
+    return {
+      referralCode: user.referralCode,
+      referredSignups,
+      referralBadge: rewards[0] ? { awardedAt: rewards[0].awardedAt } : null,
+    };
+  }
+
+  /**
+   * Alias used by the controller for the public profile lookup.
+   */
+  async getPublicProfile(username: string): Promise<PublicUserDto> {
+    return this.findPublicProfile(username);
+  }
+
   /**
    * Wins and losses in completed two-player sessions. Wagered matches are
    * sessions too, so they are counted here once, not again from wagers.
@@ -219,8 +259,12 @@ export class UsersService {
       ...wagerStats,
     };
 
+    const { lastDailyAttemptDate, ...profile } = user;
     return {
+      ...profile,
+      dailyStreak: currentDailyStreak(user.dailyStreak, lastDailyAttemptDate),
       ...user,
+      emailVerified: Boolean(user.emailVerifiedAt),
       levelTitle: this.getLevelTitle(level),
       wallet: user.stellarAddress
         ? {
@@ -233,8 +277,13 @@ export class UsersService {
     };
   }
 
+  async getUserTokenBalance(userId: string) {
+    const stroops = await this.tokenService.getUserBalance(userId);
+    return { stroops, display: fromStroops(stroops) };
+  }
+
   /**
-   * The same balance /game-sessions/tokens/balance reports: the mock balance
+   * The same balance /users/me/balance reports: the mock balance
    * in mock mode, the token contract in stellar mode. A failed RPC call must
    * not take the whole profile down, so it yields `balance: null` and a
    * reason instead.
@@ -244,9 +293,12 @@ export class UsersService {
     balanceUnavailableReason?: string;
   }> {
     try {
-      const stroops = await this.tokenService.getUserBalance(userId);
+      const balance = await this.getUserTokenBalance(userId);
       return {
-        balance: { stroops, display: fromStroops(stroops), symbol: TOKEN_SYMBOL },
+        balance: {
+          ...balance,
+          symbol: TOKEN_SYMBOL,
+        },
       };
     } catch (error) {
       this.logger.warn(
@@ -347,21 +399,140 @@ export class UsersService {
     return 'Rookie';
   }
 
-  async update(id: string, updateUserDto: UpdateProfileDto | AdminUpdateUserDto) {
-    const user = await this.findOne(id);
+  async reportPlayer(
+    reporterId: string,
+    playerId: string,
+    report: CreatePlayerReportDto,
+  ): Promise<void> {
+    await submitPlayerReport(this.userRepository.manager, reporterId, playerId, report);
+  }
 
-    // Report taken usernames/emails as 409 rather than a unique-index 500
-    const { username } = updateUserDto;
-    const email = 'email' in updateUserDto ? updateUserDto.email : undefined;
-    if (username && username !== user.username) {
-      await this.assertUnused({ username }, id, 'Username already exists');
+  async blockPlayer(blockerId: string, blockedId: string): Promise<void> {
+    if (blockerId === blockedId) {
+      throw new BadRequestException('Cannot block your own account');
     }
-    if (email && email !== user.email) {
-      await this.assertUnused({ email }, id, 'Email already exists');
+    if (!(await this.userRepository.existsBy({ id: blockedId }))) {
+      throw new NotFoundException('Player not found');
     }
+    const [first, second] = orderedPlayers(blockerId, blockedId);
+    await this.userRepository.manager.transaction(async (manager) => {
+      await lockPlayerPair(manager, first, second);
+      await manager.createQueryBuilder().insert().into(UserBlock)
+        .values({ blockerId, blockedId }).orIgnore().execute();
+      await manager.query(
+        'DELETE FROM friendships WHERE "firstId" = $1 AND "secondId" = $2',
+        [first, second],
+      );
+    });
+  }
 
-    Object.assign(user, updateUserDto);
-    return this.userRepository.save(user);
+  async unblockPlayer(blockerId: string, blockedId: string): Promise<void> {
+    await this.userRepository.manager.delete(UserBlock, {
+      blockerId,
+      blockedId,
+    });
+  }
+
+  async update(
+    id: string,
+    updateUserDto: UpdateProfileDto | AdminUpdateUserDto,
+  ) {
+    return this.userRepository.manager.transaction(async (manager) => {
+      const repository = manager.getRepository(User);
+      const user = await repository.findOne({
+        where: { id },
+        lock: { mode: 'pessimistic_write' },
+      });
+      if (!user) {
+        throw new NotFoundException(`User with ID ${id} not found`);
+      }
+
+      const originalUsername = user.username;
+      const before = { role: user.role, isActive: user.isActive };
+      const { username } = updateUserDto;
+      const email = 'email' in updateUserDto ? updateUserDto.email : undefined;
+      if (username && username !== user.username) {
+        const violation = usernameRuleViolation(username);
+        if (violation) {
+          throw new BadRequestException(violation);
+        }
+        await this.assertUnusedWithRepository(
+          repository,
+          { username },
+          id,
+          'Username already exists',
+        );
+      }
+      if (email && email !== user.email) {
+        await this.assertUnusedWithRepository(
+          repository,
+          { email },
+          id,
+          'Email already exists',
+        );
+      }
+
+      const nextRole =
+        'role' in updateUserDto && updateUserDto.role !== undefined
+          ? updateUserDto.role
+          : user.role;
+      const nextIsActive =
+        'isActive' in updateUserDto && updateUserDto.isActive !== undefined
+          ? updateUserDto.isActive
+          : user.isActive;
+
+      if (
+        before.role === Role.Admin &&
+        before.isActive &&
+        (nextRole !== Role.Admin || !nextIsActive)
+      ) {
+        const activeAdminCount = await repository.count({
+          where: { role: Role.Admin, isActive: true },
+        });
+        if (activeAdminCount <= 1) {
+          throw new ConflictException(
+            'The last active admin cannot be demoted or deactivated',
+          );
+        }
+      }
+
+      Object.assign(user, updateUserDto);
+      const saved = await repository.save(user);
+      const after = { role: saved.role, isActive: saved.isActive };
+      Object.defineProperty(saved, 'auditContext', {
+        value:
+          saved.username === originalUsername
+            ? { before, after }
+            : {
+                before: { ...before, username: originalUsername },
+                after: { ...after, username: saved.username },
+              },
+        enumerable: false,
+      });
+      await this.cacheManager.del(`user:${id}`);
+      return saved;
+    });
+  }
+
+  private async assertUnusedWithRepository(
+    repository: Repository<User>,
+    where: { username: string } | { email: string },
+    ownId: string,
+    message: string,
+  ): Promise<void> {
+    const [column, value] =
+      'username' in where
+        ? ['username', where.username]
+        : ['email', where.email];
+    const taken = await repository.exists({
+      where: {
+        [column]: Raw((alias) => `LOWER(${alias}) = LOWER(:value)`, { value }),
+        id: Not(ownId),
+      },
+    });
+    if (taken) {
+      throw new ConflictException(message);
+    }
   }
 
   /**
@@ -397,8 +568,6 @@ export class UsersService {
    * every row that references the user id is preserved.
    */
   async remove(id: string) {
-    const user = await this.findOne(id);
-
     const activeWager = await this.wagerRepository.findOne({
       where: [
         { playerAId: id, status: In(NON_TERMINAL_WAGER_STATUSES) },
@@ -411,26 +580,56 @@ export class UsersService {
       );
     }
 
-    await this.userRepository.manager.transaction(async (manager) => {
-      // Revoke every refresh token and bump tokenVersion so any access token
-      // already issued stops validating immediately (R2-28).
-      await manager.delete(RefreshToken, { userId: id });
-      user.tokenVersion = (user.tokenVersion ?? 0) + 1;
+    const auditResult = await this.userRepository.manager.transaction(
+      async (manager) => {
+        const repository = manager.getRepository(User);
+        const user = await repository.findOne({
+          where: { id },
+          lock: { mode: 'pessimistic_write' },
+        });
+        if (!user) {
+          throw new NotFoundException(`User with ID ${id} not found`);
+        }
 
-      user.isActive = false;
-      user.email = `deleted-${user.id}@deleted.lyricsflip.local`;
-      user.username = `deleted_${user.id}`;
-      user.name = null;
-      user.stellarAddress = null;
-      user.stellarAddressVerifiedAt = null;
+        const before = { role: user.role, isActive: user.isActive };
+        if (before.role === Role.Admin && before.isActive) {
+          const activeAdminCount = await repository.count({
+            where: { role: Role.Admin, isActive: true },
+          });
+          if (activeAdminCount <= 1) {
+            throw new ConflictException(
+              'The last active admin cannot be deleted',
+            );
+          }
+        }
 
-      await manager.save(user);
-    });
+        // Revoke every refresh token and bump tokenVersion so any access token
+        // already issued stops validating immediately (R2-28).
+        await manager.delete(RefreshToken, { userId: id });
+        user.tokenVersion = (user.tokenVersion ?? 0) + 1;
+
+        user.isActive = false;
+        user.email = `deleted-${user.id}@deleted.lyricsflip.local`;
+        user.username = `deleted_${user.id}`;
+        user.name = null;
+        user.stellarAddress = null;
+        user.stellarAddressVerifiedAt = null;
+
+        const saved = await manager.save(user);
+        const after = { role: saved.role, isActive: saved.isActive };
+        return { before, after };
+      },
+    );
 
     await this.erasePersonalData(id);
     await this.cacheManager.del(`user:${id}`);
 
-    return { message: 'User deactivated successfully' };
+    const result = { message: 'User deactivated successfully' };
+    Object.defineProperty(result, 'auditContext', {
+      value: auditResult,
+      enumerable: false,
+    });
+    return result;
   }
 
   /**
@@ -646,19 +845,49 @@ export class UsersService {
    * Leaderboard page. Ranks are computed with competition ranking
    * (`RANK() OVER (ORDER BY xp DESC)`) so tied users share the same rank,
    * matching the rank reported by `getMyRank`.
+   *
+   * Accepts either an options object (`{ limit, offset, period }`) or the
+   * legacy positional `(limit, offset, period)` arguments.
    */
   async getLeaderboard(
-    limit: number = 20,
-    offset: number = 0,
-    period: LeaderboardPeriod = 'all',
+    optionsOrLimit: LeaderboardOptions | number = {},
+    offsetArg: number = 0,
+    periodArg: LeaderboardPeriod = 'all',
   ) {
+    let limit: number;
+    let offset: number;
+    let period: LeaderboardPeriod;
+
+    if (typeof optionsOrLimit === 'number') {
+      limit = optionsOrLimit;
+      offset = offsetArg;
+      period = periodArg;
+    } else {
+      limit = optionsOrLimit.limit ?? 20;
+      offset = optionsOrLimit.offset ?? 0;
+      period = optionsOrLimit.period ?? 'all';
+    }
+
+    if (!LEADERBOARD_PERIODS.includes(period)) {
+      throw new BadRequestException(
+        `Invalid leaderboard period: ${period}. Expected one of ${LEADERBOARD_PERIODS.join(', ')}`,
+      );
+    }
+
     const safeLimit = Math.min(Math.max(limit, 1), MAX_PAGE_SIZE);
     const safeOffset = Math.max(offset, 0);
 
+    // With AUTH_REQUIRE_VERIFIED_EMAIL on, unverified accounts are not listed.
+    const verifiedOnly = isVerifiedEmailRequired()
+      ? 'WHERE "emailVerifiedAt" IS NOT NULL'
+      : '';
+
     const rows = await this.userRepository.query(
-      `SELECT id, username, xp, level, level_title AS "levelTitle",
+      `SELECT id, username, xp, level, "levelTitle",
               RANK() OVER (ORDER BY xp DESC) AS rank
          FROM users
+        ${verifiedOnly}
+        WHERE "isActive" = true
         ORDER BY xp DESC, id ASC
         LIMIT $1 OFFSET $2`,
       [safeLimit, safeOffset],
@@ -679,6 +908,7 @@ export class UsersService {
       `SELECT rank FROM (
          SELECT id, RANK() OVER (ORDER BY xp DESC) AS rank
            FROM users
+           WHERE "isActive" = true
        ) ranked
        WHERE id = $1`,
       [userId],

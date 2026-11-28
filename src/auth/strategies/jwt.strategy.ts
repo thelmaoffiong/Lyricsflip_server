@@ -1,4 +1,8 @@
-import { Injectable, UnauthorizedException } from '@nestjs/common';
+import {
+  DomainException,
+  ErrorCode,
+} from '../../common/exceptions/domain.exception';
+import { HttpStatus, Injectable, UnauthorizedException } from '@nestjs/common';
 import { PassportStrategy } from '@nestjs/passport';
 import { ExtractJwt, Strategy } from 'passport-jwt';
 import { ConfigService } from '@nestjs/config';
@@ -7,6 +11,7 @@ import { Repository } from 'typeorm';
 import { JwtPayload } from '../interfaces/jwt-payload.interface';
 import { User } from '../../users/entities/user.entity';
 import { INACTIVE_USER_MESSAGE } from '../services/auth-token.service';
+import { jwtSecretForToken } from '../jwt-key.util';
 
 /**
  * Shared user/token validation used by both the HTTP JWT strategy and the
@@ -30,7 +35,11 @@ export async function validateUserToken(
   // change, or a future "log out everywhere") is rejected even though it
   // has not expired yet.
   if ((payload.tokenVersion ?? 0) !== user.tokenVersion) {
-    throw new UnauthorizedException('Token has been revoked');
+    throw new DomainException(
+      ErrorCode.TOKEN_REVOKED,
+      HttpStatus.UNAUTHORIZED,
+      'Token has been revoked',
+    );
   }
 
   return user;
@@ -50,7 +59,26 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
     super({
       jwtFromRequest: ExtractJwt.fromAuthHeaderAsBearerToken(),
       ignoreExpiration: false,
-      secretOrKey: jwtSecret,
+      secretOrKeyProvider: (_request, rawJwtToken, done) => {
+        try {
+          if (typeof rawJwtToken !== 'string') {
+            throw new UnauthorizedException('Token is invalid');
+          }
+          done(
+            null,
+            jwtSecretForToken(
+              rawJwtToken,
+              jwtSecret,
+              configService.get<string>('JWT_SECRET_PREVIOUS'),
+            ),
+          );
+        } catch (error) {
+          done(error instanceof Error ? error : new Error(String(error)));
+        }
+      },
+      issuer: configService.get<string>('JWT_ISSUER', 'lyricsflip'),
+      audience: configService.get<string>('JWT_AUDIENCE', 'lyricsflip-api'),
+      algorithms: ['HS256'],
     });
   }
 

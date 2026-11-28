@@ -1,7 +1,12 @@
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { nativeToScVal, scValToNative, xdr } from '@stellar/stellar-sdk';
-import { SorobanRpc } from '@stellar/stellar-sdk';
+import {
+  Contract,
+  TransactionBuilder,
+  rpc,
+  scValToNative,
+  xdr,
+} from '@stellar/stellar-sdk';
 
 /**
  * Reads the token contract's on-chain `decimals()` once at boot and exposes it
@@ -72,33 +77,26 @@ export class TokenDecimalsService implements OnModuleInit {
       );
     }
 
-    const server = new SorobanRpc.Server(rpcUrl);
+    const server = new rpc.Server(rpcUrl);
     const account = await server.getAccount(
       this.config.get<string>('STELLAR_BOOT_ACCOUNT') ?? contractId,
     );
 
-    const tx = new (require('@stellar/stellar-sdk').TransactionBuilder)(
-      account,
-      {
-        fee: '100',
-        networkPassphrase: this.config.get<string>(
-          'STELLAR_NETWORK_PASSPHRASE',
-        ),
-      },
-    )
-      .addOperation(
-        (require('@stellar/stellar-sdk').Operation).invokeContractFunction(
-          'decimals',
-          [],
-          contractId,
-        ),
-      )
+    const contract = new Contract(contractId);
+
+    const tx = new TransactionBuilder(account, {
+      fee: '100',
+      networkPassphrase: this.config.get<string>(
+        'STELLAR_NETWORK_PASSPHRASE',
+      ),
+    })
+      .addOperation(contract.call('decimals'))
       .setTimeout(30)
       .build();
 
     const simulation = await server.simulateTransaction(tx);
 
-    if (SorobanRpc.Api.isSimulationError(simulation)) {
+    if (rpc.Api.isSimulationError(simulation)) {
       throw new Error(
         `Failed to read decimals() from ${contractId}: ${simulation.error}`,
       );
@@ -121,4 +119,20 @@ export class TokenDecimalsService implements OnModuleInit {
 
     return value;
   }
+}
+
+/**
+ * Reads configured decimals for synchronous amount conversions. A caller
+ * that supplies config can verify the value against the contract at boot.
+ */
+export function getTokenDecimals(): number;
+export function getTokenDecimals(config: ConfigService): Promise<number>;
+export function getTokenDecimals(
+  config?: ConfigService,
+): number | Promise<number> {
+  if (!config) {
+    return new TokenDecimalsService(new ConfigService()).getDecimals();
+  }
+  const service = new TokenDecimalsService(config);
+  return service.onModuleInit().then(() => service.getDecimals());
 }

@@ -1,3 +1,4 @@
+import { runtimeEnv } from '../../config/runtime-env';
 import { Test, TestingModule } from '@nestjs/testing';
 import { InFlightSettlementTracker } from './in-flight-settlement.tracker';
 
@@ -72,8 +73,8 @@ describe('InFlightSettlementTracker', () => {
     jest.useFakeTimers();
 
     // Override the drain timeout to 100 ms for the test.
-    const originalEnv = process.env['SETTLEMENT_DRAIN_TIMEOUT_MS'];
-    process.env['SETTLEMENT_DRAIN_TIMEOUT_MS'] = '100';
+    const originalEnv = runtimeEnv()['SETTLEMENT_DRAIN_TIMEOUT_MS'];
+    runtimeEnv()['SETTLEMENT_DRAIN_TIMEOUT_MS'] = '100';
 
     // Register an operation that never resolves.
     tracker.register('session-hanging');
@@ -92,9 +93,9 @@ describe('InFlightSettlementTracker', () => {
 
     // Restore env.
     if (originalEnv === undefined) {
-      delete process.env['SETTLEMENT_DRAIN_TIMEOUT_MS'];
+      delete runtimeEnv()['SETTLEMENT_DRAIN_TIMEOUT_MS'];
     } else {
-      process.env['SETTLEMENT_DRAIN_TIMEOUT_MS'] = originalEnv;
+      runtimeEnv()['SETTLEMENT_DRAIN_TIMEOUT_MS'] = originalEnv;
     }
   });
 
@@ -108,6 +109,16 @@ describe('InFlightSettlementTracker', () => {
       done();
     }
 
+    expect(tracker.count).toBe(0);
+  });
+
+  it('done callback is idempotent and safe to call multiple times', () => {
+    const done = tracker.register('session-idempotent');
+    expect(tracker.count).toBe(1);
+    done();
+    expect(tracker.count).toBe(0);
+    // Calling done again must not throw or affect the count.
+    expect(() => done()).not.toThrow();
     expect(tracker.count).toBe(0);
   });
 });

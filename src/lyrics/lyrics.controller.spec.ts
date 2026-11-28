@@ -2,8 +2,8 @@ import { Reflector } from '@nestjs/core';
 import { Test } from '@nestjs/testing';
 import { LyricsController } from './lyrics.controller';
 import { LyricsService } from './lyrics.service';
-import { CreateLyricsDto } from './dto/create-lyrics.dto';
-import { UpdateLyricsDto } from './dto/update-lyrics.dto';
+import { CreateLyricDto } from './dto/create-lyric.dto';
+import { UpdateLyricDto } from './dto/update-lyric.dto';
 import { Genre, Lyrics } from './entities/lyrics.entity';
 import type { User } from '../users/entities/user.entity';
 import { Role } from '../auth/roles/role.enum';
@@ -64,22 +64,22 @@ describe('LyricsController', () => {
     });
 
     it('from GET /lyrics', async () => {
-      const [result] = await controller.findAll(player);
+      const [result] = await controller.findAll(player, {});
       expectNoAnswer(result);
     });
 
     it('from GET /lyrics/random', async () => {
-      const [result] = await controller.getRandomLyrics(player);
+      const [result] = await controller.getRandomLyrics(player, {});
       expectNoAnswer(result);
     });
 
     it('from GET /lyrics/genre/:genre', async () => {
-      const [result] = await controller.getLyricsByGenre('Pop', player);
+      const [result] = await controller.getLyricsByGenre('Pop', player, {});
       expectNoAnswer(result);
     });
 
     it('from GET /lyrics/decade/:decade', async () => {
-      const [result] = await controller.getLyricsByDecade('2010', player);
+      const [result] = await controller.getLyricsByDecade('2010', player, {});
       expectNoAnswer(result);
     });
 
@@ -87,6 +87,38 @@ describe('LyricsController', () => {
       const roles = new Reflector().get<Role[]>(
         ROLES_KEY,
         LyricsController.prototype.getLyricsByArtist,
+      );
+      expect(roles).toEqual([Role.Admin]);
+    });
+
+    it('because GET /lyrics is admin only', () => {
+      const roles = new Reflector().get<Role[]>(
+        ROLES_KEY,
+        LyricsController.prototype.findAll,
+      );
+      expect(roles).toEqual([Role.Admin]);
+    });
+
+    it('because GET /lyrics/random is admin only', () => {
+      const roles = new Reflector().get<Role[]>(
+        ROLES_KEY,
+        LyricsController.prototype.getRandomLyrics,
+      );
+      expect(roles).toEqual([Role.Admin]);
+    });
+
+    it('because GET /lyrics/genre/:genre is admin only', () => {
+      const roles = new Reflector().get<Role[]>(
+        ROLES_KEY,
+        LyricsController.prototype.getLyricsByGenre,
+      );
+      expect(roles).toEqual([Role.Admin]);
+    });
+
+    it('because GET /lyrics/decade/:decade is admin only', () => {
+      const roles = new Reflector().get<Role[]>(
+        ROLES_KEY,
+        LyricsController.prototype.getLyricsByDecade,
       );
       expect(roles).toEqual([Role.Admin]);
     });
@@ -130,8 +162,8 @@ describe('LyricsController', () => {
             )) as unknown[];
 
       expect(paramTypes()).toEqual([LyricsService]);
-      expect(paramTypes('create')[0]).toBe(CreateLyricsDto);
-      expect(paramTypes('update')[1]).toBe(UpdateLyricsDto);
+      expect(paramTypes('create')[0]).toBe(CreateLyricDto);
+      expect(paramTypes('update')[1]).toBe(UpdateLyricDto);
     });
   });
 });

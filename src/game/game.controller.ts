@@ -53,10 +53,42 @@ export class GameController {
   @ApiQuery({ name: 'decade', required: false, type: String })
   @ApiQuery({ name: 'genre', required: false, type: String })
   @ApiQuery({ name: 'excludeIds', required: false, type: [Number] })
+  @ApiQuery({
+    name: 'sessionId',
+    required: false,
+    schema: { type: 'string', format: 'uuid' },
+  })
+  @ApiQuery({ name: 'ignorePreferences', required: false, type: Boolean })
+  @ApiQuery({
+    name: 'difficulty',
+    required: false,
+    schema: { type: 'integer', minimum: 1, maximum: 5 },
+  })
   @ApiResponse({
     status: 200,
     description: 'A playable lyric and a round id.',
-    type: Object,
+    schema: {
+      type: 'object',
+      required: [
+        'roundId',
+        'issuedAt',
+        'expiresAt',
+        'answerWindowSeconds',
+        'id',
+        'lyricSnippet',
+      ],
+      properties: {
+        roundId: { type: 'string', format: 'uuid' },
+        issuedAt: { type: 'string', format: 'date-time' },
+        expiresAt: { type: 'string', format: 'date-time' },
+        answerWindowSeconds: { type: 'integer' },
+        id: { type: 'integer' },
+        lyricSnippet: { type: 'string' },
+        category: { type: 'string' },
+        decade: { type: 'string' },
+        genre: { type: 'string' },
+      },
+    },
   })
   @Get('lyric')
   async getRandomLyric(
@@ -69,20 +101,21 @@ export class GameController {
     );
 
     try {
-      const lyric = await this.gameLogicService.getRandomLyric({
-        ...options,
-        // Pass the player's preferences so the service can use them as
-        // fallback filters when no explicit genre/decade was supplied (#176).
-        // Only forward the preferred genre when it is a valid lyric genre;
-        // otherwise the fallback would throw a 400 for stored preferences
-        // that are not part of the lyric `Genre` enum (#310).
-        preferredGenre: this.toLyricGenre(user.preferredGenre),
-        preferredDecade: user.preferredDecade ?? undefined,
-      });
-      const round = await this.gameLogicService.issueRound(
+      // Pick a lyric and issue the round in one step so the HTTP controller
+      // and the socket gateway share a single code path (#444).
+      const { lyric, round } = await this.gameLogicService.startRound(
         user.id,
-        lyric.id,
-        sessionId,
+        {
+          ...options,
+          sessionId,
+          // Pass the player's preferences so the service can use them as
+          // fallback filters when no explicit genre/decade was supplied (#176).
+          // Only forward the preferred genre when it is a valid lyric genre;
+          // otherwise the fallback would throw a 400 for stored preferences
+          // that are not part of the lyric `Genre` enum (#310).
+          preferredGenre: this.toLyricGenre(user.preferredGenre),
+          preferredDecade: user.preferredDecade ?? undefined,
+        },
       );
 
       // Return only the fields needed for the game (hide correct answers)
@@ -125,6 +158,17 @@ export class GameController {
   @ApiQuery({ name: 'decade', required: false, type: String })
   @ApiQuery({ name: 'genre', required: false, type: String })
   @ApiQuery({ name: 'excludeIds', required: false, type: [Number] })
+  @ApiQuery({
+    name: 'sessionId',
+    required: false,
+    schema: { type: 'string', format: 'uuid' },
+  })
+  @ApiQuery({ name: 'ignorePreferences', required: false, type: Boolean })
+  @ApiQuery({
+    name: 'difficulty',
+    required: false,
+    schema: { type: 'integer', minimum: 1, maximum: 5 },
+  })
   @ApiResponse({
     status: 200,
     description: 'A list of playable lyrics.',
